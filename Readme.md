@@ -1,4 +1,4 @@
-#Concepts
+# Concepts
 
 Task can be found here:
 https://github.com/sat2707/hlcupdocs/blob/master/TECHNICAL_TASK.md
