@@ -1,14 +1,14 @@
 <?php
 /**
+ * Mail.ru Highload contest
+ * v3 solution - based on Swoole.
  *
+ * @author Evgeniy Bogdanov
  */
 
-//error_reporting(E_ALL);
+error_reporting(E_ALL ^ E_WARNING );
 
-//ini_set('display_errors', 'on');
-//ini_set('display_startup_errors', 'on');
-
-ini_set('memory_limit', '-1`');
+ini_set('memory_limit', '-1');
 
 if (php_sapi_name() != 'cli') {
     die("CLI script only\n");
@@ -22,9 +22,9 @@ abstract class Storage {
 
     protected $isIndexReady = false;
 
-    protected $fields = array();
+    protected $fields = [];
 
-    protected $data = array();
+    protected $data = [];
 
     protected $numberOfFields = 0;
 
@@ -81,14 +81,16 @@ abstract class Storage {
             return RESULT_FAILED;
         }
 
-        $newData = array();
+        $newData = [];
         foreach ($this->fields as $i => $field) {
             if (isset($values[$field])) {
                 $newData[$i] = $values[$field];
             }
         }
 
-        $this->data[$id] = array_replace($this->data[$id], $newData);
+        if (!empty($newData)) {
+            $this->data[$id] = array_replace($this->data[$id], $newData);
+        }
         $this->isIndexReady = false;
 
         return RESULT_OK;
@@ -114,13 +116,9 @@ abstract class Storage {
      */
     public function getJSON($id) : string {
         $data = $this->getById($id);
-        if (is_null($data)) return "";
+        if (is_null($data)) return '';
 
         $return = array_combine($this->getFields(), $data);
-        if (empty($return)) {
-            var_dump($this->getFields());
-            var_dump($data);
-        }
         return json_encode($return, true);
     }
 
@@ -129,6 +127,15 @@ abstract class Storage {
      */
     public function getFields() : array {
         return $this->fields;
+    }
+
+    /**
+     * Get size of stored records
+     *
+     * @return int
+     */
+    public function getSize() {
+        return count($this->data);
     }
 
     /**
@@ -153,6 +160,12 @@ class Users extends Storage {
 
     protected $fields = ['id', 'email', 'first_name', 'last_name', 'gender', 'birth_date'];
 
+    /**
+     * @param string $id
+     * @param array $values
+     *
+     * @return bool
+     */
     public function add($id, $values): bool {
         if (!$this->validate($values)) {
             return false;
@@ -163,6 +176,11 @@ class Users extends Storage {
         return parent::add($id, $values);
     }
 
+    /**
+     * @param int $id
+     * @param array $values
+     * @return int
+     */
     public function update($id, $values): int {
         $return = parent::update($id, $values);
 
@@ -186,14 +204,10 @@ class Users extends Storage {
     public function getJSON($id) : string {
         $data = $this->getById($id);
 
-        if (is_null($data)) return "";
+        if (is_null($data)) return '';
         unset($data[Users::HIDDEN_FIELD_AGE]);
 
         $return = array_combine($this->getFields(), $data);
-        if (empty($return)) {
-            var_dump($this->getFields());
-            var_dump($data);
-        }
         return json_encode($return, true);
     }
 
@@ -275,13 +289,16 @@ class Visits extends Storage {
      * @return int
      */
     public function update($id, $values): int {
+        $record = $this->data[$id];
         $return = parent::update($id, $values);
 
         if ($return !== RESULT_OK) {
             return $return;
         }
 
-        $record = $this->data[$id];
+        unset($this->_idxByLocationId[$record[Visits::FIELD_LOCATION]][$id]);
+        unset($this->_idxByUserId[$record[Visits::FIELD_USER]][$id]);
+
         $this->addToIndexes($id, $record);
 
         return RESULT_OK;
@@ -372,8 +389,6 @@ class Visits extends Storage {
                     return false;
                 }
             }
-        } else {
-            var_dump($values);
         }
 
         if (isset($values[Visits::FIELD_MARK]) && (
@@ -507,7 +522,6 @@ foreach ($masks as $mask) {
     $files = glob('/tmp/init/' . $mask . '*.json');
 
     foreach ($files as $fileName) {
-        echo "\t" . $fileName, PHP_EOL;
         $data = file_get_contents($fileName);
         $json = json_decode($data, true);
 
@@ -555,52 +569,60 @@ unset($data);
 unset($json);
 
 // Rebuild User's index with checking visited_at
- $visitsStorage->buildUsersIndex();
+$visitsStorage->buildUsersIndex();
 
 $Data::setUsers($usersStorage);
 $Data::setVisits($visitsStorage);
 $Data::setLocations($locationsStorage);
 
+echo 'Users records ',$usersStorage->getSize(),PHP_EOL;
+echo 'Visits records ',$visitsStorage->getSize(),PHP_EOL;
+echo 'Locations records ',$locationsStorage->getSize(),PHP_EOL,PHP_EOL;
+
 echo 'Started web-server...' , PHP_EOL;
 
 // Start Web Server
-$base = new EventBase();
-$http = new EventHttp($base);
-$http->setAllowedMethods(EventHttpRequest::CMD_GET | EventHttpRequest::CMD_POST);
+$http = new Swoole\Http\Server('0.0.0.0', 80, SWOOLE_BASE);
+$http->set([
+    'log_file' => '/dev/null',
+    'max_request' => 20,   //reload worker by run xx times
+    'worker_num'  => 100,
+    'dispatch_mode' => 3,   // who come first who is
+    'reactor_num'   => 1,   // depend cpu how much cpu you have
+    'backlog'       => 512, // accept queue
+    'open_cpu_affinity' => 1, // get cpu more time
+    'open_tcp_nodelay' => 1, // for small packet to open
+    'max_conn' => 20000,
+    'open_tcp_keepalive' => 0,
+    'daemonize' => 0,
+]);
 
-$http->setDefaultCallback(function($request) use(&$Data) {
-    $query = parse_url($request->getUri());
-
-    $jsonOutput = "";
+$http->on('request', function ($request, $response) use(&$Data) {
+    $query = parse_url($request->server['request_uri']);
+    $jsonOutput = '';
 
     // Get request options
     $uri = explode('/', rtrim($query['path'], '/'));
 
     // Process POST
-    if ($request->getCommand() === EventHttpRequest::CMD_POST) {
-        $POST = '';
-
-        $buf = $request->getInputBuffer();
-        $length = $buf->length;
-        while ($string = $buf->read($length)) {
-            $POST .= $string;
-        }
+    if ($request->server['request_method'] === 'POST') {
+        $POST = $request->rawContent();
 
         // Decode input JSON
         $jsonInput = json_decode($POST, true);
 
-        if (empty($jsonInput)) {
-            echo $POST,PHP_EOL;
-        }
-
         if (!empty($jsonInput)) {
             foreach ($jsonInput as $field => $value) {
                 if (is_null($value)) {
-                    $request->sendReply(400, 'Bad Request');
+                    $response->status(400);
+                    $response->end();
+                    return;
                 }
             }
         } else {
-            $request->sendReply(400, 'Bad Request');
+            $response->status(400);
+            $response->end();
+            return;
         }
 
         // OK, we've input. Now we need to understand what we do - add new,
@@ -638,48 +660,48 @@ $http->setDefaultCallback(function($request) use(&$Data) {
             }
 
             if ($result === true) {
-                $jsonOutput = '{}';
+                $response->header('Content-Type', 'application/json');
+                $response->header('Content-Length', 2);
+                $response->end('{}');
             } elseif ($result === false) {
-                $request->sendReply(400, 'Bad Request');
+                $response->status(400);
+                $response->end();
+                return;
             }
 
-        } else {
+        } elseif (is_numeric($uri[2])) {
             // We're updating entity
             $result = null;
-            if (is_numeric($uri[2])) {
-                $id = intval($uri[2]);
+            $id = $uri[2] + 0;
 
-                if ($uri[1] === 'users') {
-                    $result = $Data::getUsers()->update($id, $jsonInput);
-                } elseif ($uri[1] === 'visits') {
-                    $result = $Data::getVisits()->update($id, $jsonInput);
-                } elseif ($uri[1] === 'locations') {
-                    $result = $Data::getLocations()->update($id, $jsonInput);
-                }
+            if ($uri[1] === 'users') {
+                $result = $Data::getUsers()->update($id, $jsonInput);
+            } elseif ($uri[1] === 'visits') {
+                $result = $Data::getVisits()->update($id, $jsonInput);
+            } elseif ($uri[1] === 'locations') {
+                $result = $Data::getLocations()->update($id, $jsonInput);
+            }
 
-                if ($result === RESULT_OK) {
-                    $jsonOutput = '{}';
-                } elseif ($result === RESULT_FAILED) {
-                    $request->sendReply(400, 'Bad Request');
-                } elseif ($result === RESULT_NOT_FOUND) {
-                    $request->sendReply(404, 'Not Found');
-                }
+            if ($result === RESULT_OK) {
+                $response->header('Content-Type', 'application/json');
+                $response->header('Content-Length', 2);
+                $response->end('{}');
+            } elseif ($result === RESULT_FAILED) {
+                $response->status(400);
+                $response->end();
+                return;
+            } elseif ($result === RESULT_NOT_FOUND) {
+                $response->status(404);
+                $response->end();
+                return;
             }
         }
 
         if (!$jsonOutput) {
-            $request->sendReply(404, 'Not Found');
+            $response->status(404);
+            $response->end();
+            return;
         }
-
-        $reply = <<<REPLY
-OK
-Content-Length: 2
-Content-Type: application/json; charset=utf-8
-
-{}
-REPLY;
-
-        $request->sendReply(200, $reply);
     } else {
         // Process GET commands
         $argCount = count($uri);
@@ -700,17 +722,18 @@ REPLY;
             if ($uri[1] == 'users' && $uri[3] == 'visits') {
                 $id = $uri[2];
 
-                $params = array();
-                if (isset($query['query'])) {
-                    parse_str($query['query'], $params);
+                $params = [];
+                if (isset($request->server['query_string'])) {
+                    parse_str($request->server['query_string'], $params);
                 }
 
                 // $fromDate, $toDate, $country, $toDistance
-
                 // Validate request
-                foreach (array('fromDate', 'toDate', 'toDistance') as $option) {
+                foreach (['fromDate', 'toDate', 'toDistance'] as $option) {
                     if (isset($params[$option]) && (is_null($params[$option]) || !is_numeric($params[$option]))) {
-                        $request->sendReply(400, 'Bad Request');
+                        $response->status(400);
+                        $response->end();
+                        return;
                     }
                 }
 
@@ -768,26 +791,32 @@ REPLY;
                  toAge - учитывать только путешественников, у которых возраст(считается от текущего timestamp) строго меньше этого параметра
                  gender - учитывать оценки только мужчин или женщин
                  */
-                $params = array();
-                if (isset($query['query'])) {
-                    parse_str($query['query'], $params);
+                $params = [];
+                if (isset($request->server['query_string'])) {
+                    parse_str($request->server['query_string'], $params);
                 }
 
-                foreach (array('fromDate', 'toDate', 'fromAge', 'toAge') as $option) {
+                foreach (['fromDate', 'toDate', 'fromAge', 'toAge'] as $option) {
                     if (isset($params[$option]) && (is_null($params[$option]) || !is_numeric($params[$option]))) {
-                        $request->sendReply(400, 'Bad Request');
+                        $response->status(400);
+                        $response->end();
+                        return;
                     }
                 }
 
                 if (isset($params['gender']) && !preg_match_all('/^[fm]$/', $params['gender'])) {
-                    $request->sendReply(400, 'Bad Request');
+                    $response->status(400);
+                    $response->end();
+                    return;
                 }
 
                 // OK, now let's calculate average value
                 $location = $Data::getLocations()->getById($id);
 
                 if (empty($location)) {
-                    $request->sendReply(404, 'Not Found');
+                    $response->status(404);
+                    $response->end();
+                    return;
                 }
 
                 $lookupUserData = isset($params['fromAge'])
@@ -837,45 +866,16 @@ REPLY;
             }
         }
 
-        if ($jsonOutput !== "") {
-            $length = strlen($jsonOutput);
-
-            $reply = <<<REPLY
-OK
-Content-Length: $length
-Content-Type: application/json; charset=utf-8
-
-$jsonOutput
-REPLY;
-
-            $request->sendReply(200, $reply);
-        } else {
-            $request->sendReply(404, 'Not Found');
+        if ($jsonOutput !== '') {
+            $response->header('Content-Type', 'application/json');
+            $response->end($jsonOutput);
+            return;
         }
+
+        $response->status(404);
+        $response->end();
+        return;
     }
 });
 
-$http->setCallback('/about', function($response) {
-    $reply = <<<REPLY
-OK
-Content-Length: 66
-Content-Type: application/json; charset=utf-8
-
-{"about": "Highload Mail.ru contest solution. Afterhours version"}
-REPLY;
-
-    $response->sendReply(200, $reply);
-});
-
-if (!$http->bind('0.0.0.0', 80)) {
-    echo 'Unable to bind',PHP_EOL;
-    exit(255);
-}
-
-$signal = Event::signal($base, SIGINT, function() use ($base) {
-    echo "Caught SIGINT. Stopping...\n";
-    $base->stop();
-});
-$signal->add();
-
-$base->loop();
+$http->start();
